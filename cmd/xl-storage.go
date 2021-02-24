@@ -264,9 +264,10 @@ func newXLStorage(ep Endpoint) (*xlStorage, error) {
 				return &b
 			},
 		},
-		globalSync: env.Get(config.EnvFSOSync, config.EnableOff) == config.EnableOn,
-		ctx:        GlobalContext,
-		rootDisk:   rootDisk,
+		globalSync:           env.Get(config.EnvFSOSync, config.EnableOff) == config.EnableOn,
+		ctx:                  GlobalContext,
+		rootDisk:             rootDisk,
+		readODirectSupported: true,
 	}
 
 	// Create all necessary bucket folders if possible.
