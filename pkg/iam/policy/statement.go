@@ -115,7 +115,7 @@ func (statement Statement) isValid() error {
 		}
 
 		keys := statement.Conditions.Keys()
-		keyDiff := keys.Difference(actionConditionKeyMap[action])
+		keyDiff := keys.Difference(iamActionConditionKeyMap.Lookup(action))
 		if !keyDiff.IsEmpty() {
 			return Errorf("unsupported condition keys '%v' used for action '%v'", keyDiff, action)
 		}

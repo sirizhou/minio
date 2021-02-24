@@ -672,10 +672,10 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions) (entr
 					return nil
 				}
 				o.debugln(color.Green("listPath:")+" saving block", b.n, "to", o.objectPath(b.n))
-				r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)), false)
+				r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
 				logger.LogIf(ctx, err)
 				custom := b.headerKV()
-				_, err = er.putObject(ctx, minioMetaBucket, o.objectPath(b.n), NewPutObjReader(r, nil, nil), ObjectOptions{
+				_, err = er.putObject(ctx, minioMetaBucket, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
 					UserDefined:    custom,
 					NoLock:         true, // No need to hold namespace lock, each prefix caches uniquely.
 					ParentIsObject: nil,
@@ -782,7 +782,13 @@ type listPathRawOptions struct {
 	disks        []StorageAPI
 	bucket, path string
 	recursive    bool
+
+	// Only return results with this prefix.
 	filterPrefix string
+
+	// Forward to this prefix before returning results.
+	forwardTo string
+
 	// Minimum number of good disks to continue.
 	// An error will be returned if this many disks returned an error.
 	minDisks       int
@@ -836,7 +842,9 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				BaseDir:        opts.path,
 				Recursive:      opts.recursive,
 				ReportNotFound: opts.reportNotFound,
-				FilterPrefix:   opts.filterPrefix}, w)
+				FilterPrefix:   opts.filterPrefix,
+				ForwardTo:      opts.forwardTo,
+			}, w)
 			w.CloseWithError(werr)
 			if werr != io.EOF && werr != nil && werr.Error() != errFileNotFound.Error() && werr.Error() != errVolumeNotFound.Error() {
 				logger.LogIf(ctx, werr)

@@ -179,6 +179,14 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 	if err != nil || rcfg == nil {
 		return false, false, sync
 	}
+	opts := replication.ObjectOpts{
+		Name:         dobj.ObjectName,
+		SSEC:         crypto.SSEC.IsEncrypted(oi.UserDefined),
+		UserTags:     oi.UserTags,
+		DeleteMarker: oi.DeleteMarker,
+		VersionID:    dobj.VersionID,
+	}
+	replicate = rcfg.Replicate(opts)
 	// when incoming delete is removal of a delete marker( a.k.a versioned delete),
 	// GetObjectInfo returns extra information even though it returns errFileNotFound
 	if gerr != nil {
@@ -187,10 +195,12 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 		case replication.Pending, replication.Completed, replication.Failed:
 			validReplStatus = true
 		}
-		if oi.DeleteMarker && validReplStatus {
+		if oi.DeleteMarker && (validReplStatus || replicate) {
 			return oi.DeleteMarker, true, sync
 		}
-		return oi.DeleteMarker, false, sync
+		// can be the case that other cluster is down and duplicate `mc rm --vid`
+		// is issued - this still needs to be replicated back to the other target
+		return oi.DeleteMarker, oi.VersionPurgeStatus == Pending || oi.VersionPurgeStatus == Failed, sync
 	}
 	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, rcfg.RoleArn)
 	// the target online status should not be used here while deciding
@@ -198,14 +208,7 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 	if tgt == nil {
 		return oi.DeleteMarker, false, false
 	}
-	opts := replication.ObjectOpts{
-		Name:         dobj.ObjectName,
-		SSEC:         crypto.SSEC.IsEncrypted(oi.UserDefined),
-		UserTags:     oi.UserTags,
-		DeleteMarker: oi.DeleteMarker,
-		VersionID:    dobj.VersionID,
-	}
-	return oi.DeleteMarker, rcfg.Replicate(opts), tgt.replicateSync
+	return oi.DeleteMarker, replicate, tgt.replicateSync
 }
 
 // replicate deletes to the designated replication target if replication configuration
@@ -241,6 +244,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectVersionInfo, objectA
 		})
 		return
 	}
+
 	tgt := globalBucketTargetSys.GetRemoteTargetClient(ctx, rcfg.RoleArn)
 	if tgt == nil {
 		logger.LogIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, rcfg.RoleArn))
@@ -276,7 +280,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectVersionInfo, objectA
 		} else {
 			versionPurgeStatus = Failed
 		}
-		logger.LogIf(ctx, fmt.Errorf("Unable to replicate delete marker to %s/%s(%s): %w", rcfg.GetDestination().Bucket, dobj.ObjectName, versionID, err))
+		logger.LogIf(ctx, fmt.Errorf("Unable to replicate delete marker to %s/%s(%s): %s", rcfg.GetDestination().Bucket, dobj.ObjectName, versionID, rmErr))
 	} else {
 		if dobj.VersionID == "" {
 			replicationStatus = string(replication.Completed)
@@ -293,14 +297,13 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectVersionInfo, objectA
 	// Update metadata on the delete marker or purge permanent delete if replication success.
 	dobjInfo, err := objectAPI.DeleteObject(ctx, bucket, dobj.ObjectName, ObjectOptions{
 		VersionID:                     versionID,
-		DeleteMarker:                  dobj.DeleteMarker,
 		DeleteMarkerReplicationStatus: replicationStatus,
 		VersionPurgeStatus:            versionPurgeStatus,
 		Versioned:                     globalBucketVersioningSys.Enabled(bucket),
 		VersionSuspended:              globalBucketVersioningSys.Suspended(bucket),
 	})
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %w", bucket, dobj.ObjectName, versionID, err))
+	if err != nil && !isErrVersionNotFound(err) { // VersionNotFound would be reported by pool that object version is missing on.
+		logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %s", bucket, dobj.ObjectName, versionID, err))
 		sendEvent(eventArgs{
 			BucketName: bucket,
 			Object: ObjectInfo{
@@ -367,7 +370,27 @@ func getCopyObjMetadata(oi ObjectInfo, dest replication.Destination) map[string]
 	return meta
 }
 
-func putReplicationOpts(ctx context.Context, dest replication.Destination, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions) {
+type caseInsensitiveMap map[string]string
+
+// Lookup map entry case insensitively.
+func (m caseInsensitiveMap) Lookup(key string) (string, bool) {
+	if len(m) == 0 {
+		return "", false
+	}
+	for _, k := range []string{
+		key,
+		strings.ToLower(key),
+		http.CanonicalHeaderKey(key),
+	} {
+		v, ok := m[k]
+		if ok {
+			return v, ok
+		}
+	}
+	return "", false
+}
+
+func putReplicationOpts(ctx context.Context, dest replication.Destination, objInfo ObjectInfo) (putOpts miniogo.PutObjectOptions, err error) {
 	meta := make(map[string]string)
 	for k, v := range objInfo.UserDefined {
 		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
@@ -401,33 +424,34 @@ func putReplicationOpts(ctx context.Context, dest replication.Destination, objIn
 			putOpts.UserTags = tag.ToMap()
 		}
 	}
-	if lang, ok := objInfo.UserDefined[xhttp.ContentLanguage]; ok {
+
+	lkMap := caseInsensitiveMap(objInfo.UserDefined)
+	if lang, ok := lkMap.Lookup(xhttp.ContentLanguage); ok {
 		putOpts.ContentLanguage = lang
 	}
-	if disp, ok := objInfo.UserDefined[xhttp.ContentDisposition]; ok {
+	if disp, ok := lkMap.Lookup(xhttp.ContentDisposition); ok {
 		putOpts.ContentDisposition = disp
 	}
-	if cc, ok := objInfo.UserDefined[xhttp.CacheControl]; ok {
+	if cc, ok := lkMap.Lookup(xhttp.CacheControl); ok {
 		putOpts.CacheControl = cc
 	}
-	if mode, ok := objInfo.UserDefined[xhttp.AmzObjectLockMode]; ok {
+	if mode, ok := lkMap.Lookup(xhttp.AmzObjectLockMode); ok {
 		rmode := miniogo.RetentionMode(mode)
 		putOpts.Mode = rmode
 	}
-	if retainDateStr, ok := objInfo.UserDefined[xhttp.AmzObjectLockRetainUntilDate]; ok {
-		rdate, err := time.Parse(time.RFC3339Nano, retainDateStr)
+	if retainDateStr, ok := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate); ok {
+		rdate, err := time.Parse(time.RFC3339, retainDateStr)
 		if err != nil {
-			return
+			return putOpts, err
 		}
 		putOpts.RetainUntilDate = rdate
 	}
-	if lhold, ok := objInfo.UserDefined[xhttp.AmzObjectLockLegalHold]; ok {
+	if lhold, ok := lkMap.Lookup(xhttp.AmzObjectLockLegalHold); ok {
 		putOpts.LegalHold = miniogo.LegalHoldStatus(lhold)
 	}
 	if crypto.S3.IsEncrypted(objInfo.UserDefined) {
 		putOpts.ServerSideEncryption = encrypt.NewSSE()
 	}
-
 	return
 }
 
@@ -621,11 +645,16 @@ func replicateObject(ctx context.Context, objInfo ObjectInfo, objectAPI ObjectLa
 		}
 	}
 	replicationStatus := replication.Completed
+	// use core client to avoid doing multipart on PUT
+	c := &miniogo.Core{Client: tgt.Client}
 	if rtype != replicateAll {
 		// replicate metadata for object tagging/copy with metadata replacement
+		srcOpts := miniogo.CopySrcOptions{
+			Bucket:    dest.Bucket,
+			Object:    object,
+			VersionID: objInfo.VersionID}
 		dstOpts := miniogo.PutObjectOptions{Internal: miniogo.AdvancedPutOptions{SourceVersionID: objInfo.VersionID}}
-		c := &miniogo.Core{Client: tgt.Client}
-		if _, err = c.CopyObject(ctx, dest.Bucket, object, dest.Bucket, object, getCopyObjMetadata(objInfo, dest), dstOpts); err != nil {
+		if _, err = c.CopyObject(ctx, dest.Bucket, object, dest.Bucket, object, getCopyObjMetadata(objInfo, dest), srcOpts, dstOpts); err != nil {
 			replicationStatus = replication.Failed
 			logger.LogIf(ctx, fmt.Errorf("Unable to replicate metadata for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, err))
 		}
@@ -642,7 +671,18 @@ func replicateObject(ctx context.Context, objInfo ObjectInfo, objectAPI ObjectLa
 			return
 		}
 
-		putOpts := putReplicationOpts(ctx, dest, objInfo)
+		putOpts, err := putReplicationOpts(ctx, dest, objInfo)
+		if err != nil {
+			logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s cfg:%s err:%w", bucket, cfg.RoleArn, err))
+			sendEvent(eventArgs{
+				EventName:  event.ObjectReplicationNotTracked,
+				BucketName: bucket,
+				Object:     objInfo,
+				Host:       "Internal: [Replication]",
+			})
+			return
+		}
+
 		// Setup bandwidth throttling
 		peers, _ := globalEndpoints.peers()
 		totalNodesCount := len(peers)
@@ -657,9 +697,9 @@ func replicateObject(ctx context.Context, objInfo ObjectInfo, objectAPI ObjectLa
 
 		// r takes over closing gr.
 		r := bandwidth.NewMonitoredReader(ctx, globalBucketMonitor, objInfo.Bucket, objInfo.Name, gr, headerSize, b, target.BandwidthLimit)
-		if _, err = tgt.PutObject(ctx, dest.Bucket, object, r, size, putOpts); err != nil {
+		if _, err = c.PutObject(ctx, dest.Bucket, object, r, size, "", "", putOpts); err != nil {
 			replicationStatus = replication.Failed
-			logger.LogIf(ctx, fmt.Errorf("Unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, err))
+			logger.LogIf(ctx, fmt.Errorf("Unable to replicate for object %s/%s(%s): %w", bucket, objInfo.Name, objInfo.VersionID, err))
 		}
 		defer r.Close()
 	}
@@ -678,9 +718,7 @@ func replicateObject(ctx context.Context, objInfo ObjectInfo, objectAPI ObjectLa
 	}
 
 	// This lower level implementation is necessary to avoid write locks from CopyObject.
-	poolIdx, err := z.getPoolIdx(ctx, bucket, object, ObjectOptions{
-		VersionID: objInfo.VersionID,
-	}, objInfo.Size)
+	poolIdx, err := z.getPoolIdx(ctx, bucket, object, objInfo.Size)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to update replication metadata for %s/%s(%s): %w", bucket, objInfo.Name, objInfo.VersionID, err))
 	} else {
@@ -842,6 +880,7 @@ func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs 
 	if err != nil {
 		return nil, false
 	}
+	reader.ObjInfo = oi.Clone()
 	return reader, true
 }
 

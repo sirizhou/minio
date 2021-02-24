@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/minio/minio/cmd/http"
 	xhttp "github.com/minio/minio/cmd/http"
@@ -120,8 +119,6 @@ type storageRESTClient struct {
 	endpoint   Endpoint
 	restClient *rest.Client
 	diskID     string
-
-	diskInfoCache timedValue
 }
 
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is makred disconnected
@@ -178,30 +175,25 @@ func (client *storageRESTClient) CrawlAndGetDataUsage(ctx context.Context, cache
 	go func() {
 		pw.CloseWithError(cache.serializeTo(pw))
 	}()
-	defer pr.Close()
 	respBody, err := client.call(ctx, storageRESTMethodCrawlAndGetDataUsage, url.Values{}, pr, -1)
 	defer http.DrainBody(respBody)
 	if err != nil {
+		pr.Close()
 		return cache, err
 	}
+	pr.Close()
 
-	var wg sync.WaitGroup
 	var newCache dataUsageCache
-	var decErr error
 	pr, pw = io.Pipe()
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		decErr = newCache.deserialize(pr)
-		pr.CloseWithError(err)
+		pr.CloseWithError(newCache.deserialize(pr))
 	}()
 	err = waitForHTTPStream(respBody, pw)
 	pw.CloseWithError(err)
 	if err != nil {
 		return cache, err
 	}
-	wg.Wait()
-	return newCache, decErr
+	return newCache, nil
 }
 
 func (client *storageRESTClient) GetDiskID() (string, error) {
@@ -218,27 +210,18 @@ func (client *storageRESTClient) SetDiskID(id string) {
 
 // DiskInfo - fetch disk information for a remote disk.
 func (client *storageRESTClient) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
-	client.diskInfoCache.Once.Do(func() {
-		client.diskInfoCache.TTL = time.Second
-		client.diskInfoCache.Update = func() (interface{}, error) {
-			var info DiskInfo
-			respBody, err := client.call(ctx, storageRESTMethodDiskInfo, nil, nil, -1)
-			if err != nil {
-				return info, err
-			}
-			defer http.DrainBody(respBody)
-			if err = msgp.Decode(respBody, &info); err != nil {
-				return info, err
-			}
-			if info.Error != "" {
-				return info, toStorageErr(errors.New(info.Error))
-			}
-			return info, nil
-		}
-	})
-	v, err := client.diskInfoCache.Get()
-	info = v.(DiskInfo)
-	return info, err
+	respBody, err := client.call(ctx, storageRESTMethodDiskInfo, nil, nil, -1)
+	if err != nil {
+		return info, err
+	}
+	defer http.DrainBody(respBody)
+	if err = msgp.Decode(respBody, &info); err != nil {
+		return info, err
+	}
+	if info.Error != "" {
+		return info, toStorageErr(errors.New(info.Error))
+	}
+	return info, nil
 }
 
 // MakeVolBulk - create multiple volumes in a bulk operation.

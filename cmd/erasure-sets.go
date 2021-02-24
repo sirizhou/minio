@@ -357,9 +357,14 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 
 	mutex := newNSLock(globalIsDistErasure)
 
+	// Number of buffers, max 2GB.
+	n := setCount * setDriveCount
+	if n > 100 {
+		n = 100
+	}
 	// Initialize byte pool once for all sets, bpool size is set to
 	// setCount * setDriveCount with each memory upto blockSizeV1.
-	bp := bpool.NewBytePoolCap(setCount*setDriveCount, blockSizeV1, blockSizeV1*2)
+	bp := bpool.NewBytePoolCap(n, blockSizeV1, blockSizeV1*2)
 
 	for i := 0; i < setCount; i++ {
 		s.erasureDisks[i] = make([]StorageAPI, setDriveCount)
@@ -1076,7 +1081,7 @@ func (s *erasureSets) CopyObjectPart(ctx context.Context, srcBucket, srcObject, 
 	startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (partInfo PartInfo, err error) {
 	destSet := s.getHashedSet(destObject)
 	auditObjectErasureSet(ctx, destObject, destSet, s.poolNumber)
-	return destSet.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, NewPutObjReader(srcInfo.Reader, nil, nil), dstOpts)
+	return destSet.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, NewPutObjReader(srcInfo.Reader), dstOpts)
 }
 
 // PutObjectPart - writes part of an object to hashedSet based on the object name.
@@ -1362,11 +1367,11 @@ func (s *erasureSets) HealBucket(ctx context.Context, bucket string, opts madmin
 		SetCount:  s.setCount,
 	}
 
-	for _, s := range s.sets {
+	for _, set := range s.sets {
 		var healResult madmin.HealResultItem
-		healResult, err = s.HealBucket(ctx, bucket, opts)
+		healResult, err = set.HealBucket(ctx, bucket, opts)
 		if err != nil {
-			return result, err
+			return result, toObjectErr(err, bucket)
 		}
 		result.Before.Drives = append(result.Before.Drives, healResult.Before.Drives...)
 		result.After.Drives = append(result.After.Drives, healResult.After.Drives...)

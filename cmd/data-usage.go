@@ -47,12 +47,12 @@ func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan
 			continue
 		}
 		size := int64(len(dataUsageJSON))
-		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size, false)
+		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
 		}
-		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
+		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r), ObjectOptions{})
 		if !isErrBucketNotFound(err) {
 			logger.LogIf(ctx, err)
 		}

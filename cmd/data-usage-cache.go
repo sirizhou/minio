@@ -91,7 +91,7 @@ type dataUsageCacheInfo struct {
 	Name       string
 	LastUpdate time.Time
 	NextCycle  uint32
-	// indicates if the disk is being healed and crawler
+	// indicates if the disk is being healed and scanner
 	// should skip healing the disk
 	SkipHealing bool
 	BloomFilter []byte               `msg:"BloomFilter,omitempty"`
@@ -485,7 +485,7 @@ type objectIO interface {
 // Only backend errors are returned as errors.
 // If the object is not found or unable to deserialize d is cleared and nil error is returned.
 func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) error {
-	r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, readLock, ObjectOptions{})
+	r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, noLock, ObjectOptions{})
 	if err != nil {
 		switch err.(type) {
 		case ObjectNotFound:
@@ -513,7 +513,7 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 	}()
 	defer pr.Close()
 
-	r, err := hash.NewReader(pr, -1, "", "", -1, false)
+	r, err := hash.NewReader(pr, -1, "", "", -1)
 	if err != nil {
 		return err
 	}
@@ -521,8 +521,8 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 	_, err = store.PutObject(ctx,
 		dataUsageBucket,
 		name,
-		NewPutObjReader(r, nil, nil),
-		ObjectOptions{})
+		NewPutObjReader(r),
+		ObjectOptions{NoLock: true})
 	if isErrBucketNotFound(err) {
 		return nil
 	}

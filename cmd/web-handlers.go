@@ -50,6 +50,7 @@ import (
 	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/pkg/etag"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/handlers"
 	"github.com/minio/minio/pkg/hash"
@@ -761,8 +762,39 @@ next:
 				}
 			}
 
-			oi, err := deleteObject(ctx, objectAPI, web.CacheAPI(), args.BucketName, objectName, nil, r, opts)
-			if replicateDel && err == nil {
+			deleteObject := objectAPI.DeleteObject
+			if web.CacheAPI() != nil {
+				deleteObject = web.CacheAPI().DeleteObject
+			}
+
+			oi, err := deleteObject(ctx, args.BucketName, objectName, opts)
+			if err != nil {
+				switch err.(type) {
+				case BucketNotFound:
+					return toJSONError(ctx, err)
+				}
+			}
+			if oi.Name == "" {
+				logger.LogIf(ctx, err)
+				continue
+			}
+
+			eventName := event.ObjectRemovedDelete
+			if oi.DeleteMarker {
+				eventName = event.ObjectRemovedDeleteMarkerCreated
+			}
+
+			// Notify object deleted event.
+			sendEvent(eventArgs{
+				EventName:  eventName,
+				BucketName: args.BucketName,
+				Object:     oi,
+				ReqParams:  extractReqParams(r),
+				UserAgent:  r.UserAgent(),
+				Host:       handlers.GetSourceIP(r),
+			})
+
+			if replicateDel {
 				dobj := DeletedObjectVersionInfo{
 					DeletedObject: DeletedObject{
 						ObjectName:                    objectName,
@@ -776,13 +808,14 @@ next:
 				}
 				scheduleReplicationDelete(ctx, dobj, objectAPI, replicateSync)
 			}
-			if goi.TransitionStatus == lifecycle.TransitionComplete && err == nil && goi.VersionID == "" {
-				deleteTransitionedObject(ctx, newObjectLayerFn(), args.BucketName, objectName, lifecycle.ObjectOpts{
-					Name:         objectName,
-					UserTags:     goi.UserTags,
-					VersionID:    goi.VersionID,
-					DeleteMarker: goi.DeleteMarker,
-					IsLatest:     goi.IsLatest,
+			if goi.TransitionStatus == lifecycle.TransitionComplete {
+				deleteTransitionedObject(ctx, objectAPI, args.BucketName, objectName, lifecycle.ObjectOpts{
+					Name:             objectName,
+					UserTags:         goi.UserTags,
+					VersionID:        goi.VersionID,
+					DeleteMarker:     goi.DeleteMarker,
+					TransitionStatus: goi.TransitionStatus,
+					IsLatest:         goi.IsLatest,
 				}, false, true)
 			}
 
@@ -1201,7 +1234,7 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	var reader io.Reader = r.Body
 	actualSize := size
 
-	hashReader, err := hash.NewReader(reader, size, "", "", actualSize, globalCLIContext.StrictS3Compat)
+	hashReader, err := hash.NewReader(reader, size, "", "", actualSize)
 	if err != nil {
 		writeWebErrorResponse(w, err)
 		return
@@ -1212,7 +1245,7 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 		metadata[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(actualSize, 10)
 
-		actualReader, err := hash.NewReader(reader, actualSize, "", "", actualSize, globalCLIContext.StrictS3Compat)
+		actualReader, err := hash.NewReader(reader, actualSize, "", "", actualSize)
 		if err != nil {
 			writeWebErrorResponse(w, err)
 			return
@@ -1222,8 +1255,8 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		size = -1 // Since compressed size is un-predictable.
 		s2c := newS2CompressReader(actualReader, actualSize)
 		defer s2c.Close()
-		reader = s2c
-		hashReader, err = hash.NewReader(reader, size, "", "", actualSize, globalCLIContext.StrictS3Compat)
+		reader = etag.Wrap(s2c, actualReader)
+		hashReader, err = hash.NewReader(reader, size, "", "", actualSize)
 		if err != nil {
 			writeWebErrorResponse(w, err)
 			return
@@ -1234,7 +1267,7 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	if mustReplicate {
 		metadata[xhttp.AmzBucketReplicationStatus] = string(replication.Pending)
 	}
-	pReader = NewPutObjReader(hashReader, nil, nil)
+	pReader = NewPutObjReader(hashReader)
 	// get gateway encryption options
 	opts, err := putOpts(ctx, r, bucket, object, metadata)
 	if err != nil {
@@ -1244,21 +1277,27 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 
 	if objectAPI.IsEncryptionSupported() {
 		if _, ok := crypto.IsRequested(r.Header); ok && !HasSuffix(object, SlashSeparator) { // handle SSE requests
-			rawReader := hashReader
-			var objectEncryptionKey crypto.ObjectKey
-			reader, objectEncryptionKey, err = EncryptRequest(hashReader, r, bucket, object, metadata)
+			var (
+				objectEncryptionKey crypto.ObjectKey
+				encReader           io.Reader
+			)
+			encReader, objectEncryptionKey, err = EncryptRequest(hashReader, r, bucket, object, metadata)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 				return
 			}
 			info := ObjectInfo{Size: size}
 			// do not try to verify encrypted content
-			hashReader, err = hash.NewReader(reader, info.EncryptedSize(), "", "", size, globalCLIContext.StrictS3Compat)
+			hashReader, err = hash.NewReader(etag.Wrap(encReader, hashReader), info.EncryptedSize(), "", "", size)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 				return
 			}
-			pReader = NewPutObjReader(rawReader, hashReader, &objectEncryptionKey)
+			pReader, err = pReader.WithEncryption(hashReader, &objectEncryptionKey)
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+				return
+			}
 		}
 	}
 
@@ -1279,8 +1318,8 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if retentionMode != "" {
-		opts.UserDefined[xhttp.AmzObjectLockMode] = string(retentionMode)
-		opts.UserDefined[xhttp.AmzObjectLockRetainUntilDate] = retentionDate.UTC().Format(iso8601TimeFormat)
+		opts.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
+		opts.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = retentionDate.UTC().Format(iso8601TimeFormat)
 	}
 
 	objInfo, err := putObject(GlobalContext, bucket, object, pReader, opts)
